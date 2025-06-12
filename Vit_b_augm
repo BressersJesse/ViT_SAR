@@ -1,0 +1,361 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import rasterio
+import numpy as np
+from pathlib import Path
+from timm.models.vision_transformer import VisionTransformer
+from tqdm import tqdm
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from torchmetrics import JaccardIndex
+import random
+from torchvision.transforms import functional as F
+
+GLC_CLASS_MAPPING = {
+    11: 0, 51: 1, 121: 2, 130: 3, 140: 4,
+    181: 5, 191: 6, 150: 7, 210: 8, 220: 9
+}
+NUM_CLASSES = len(GLC_CLASS_MAPPING)
+
+#Data Augmentation
+
+def sar_adjust_contrast(image, contrast_factor):
+    """Contrast adjustment preserving SAR channel relationships."""
+    # Input shape: (C, H, W)
+    mean = torch.mean(image, dim=(-2, -1), keepdim=True)
+    return torch.clamp((image - mean) * contrast_factor + mean, min=0.0)
+
+def sar_adjust_brightness(image, brightness_factor):
+    """Custom brightness adjustment for 2-channel SAR images."""
+    return torch.clamp(image * brightness_factor, min=0.0, max=1.0)    
+    
+class SARAugment:
+    def __init__(self, 
+                 flip_prob=0.5,
+                 noise_std=0.1,
+                 speckle_prob=0.3,
+                 contrast_range=(0.8, 1.2)):
+        """
+        SAR-specific augmentations:
+        - Vertical flips (safe for SAR azimuth symmetry)
+        - Additive Gaussian noise (system noise simulation)
+        - Speckle noise (multiplicative noise simulation)
+        - Contrast variation (different incidence angle effects)
+        """
+        self.flip_prob = flip_prob
+        self.noise_std = noise_std
+        self.speckle_prob = speckle_prob
+        self.contrast_range = contrast_range
+
+    def __call__(self, image, mask):
+        # Convert to tensor for torch operations
+        image = torch.from_numpy(image).float()
+        mask = torch.from_numpy(mask).long()
+
+        # 1. Vertical flip (safe for SAR left/right looking systems)
+        if random.random() < self.flip_prob:
+            image = F.vflip(image)
+            mask = F.vflip(mask)
+
+
+        # 3. Additive Gaussian noise (system noise simulation)
+        if random.random() < 0.5:
+            noise = torch.randn_like(image) * self.noise_std
+            image = image + noise
+
+        # 4. Speckle noise (multiplicative noise simulation)
+        if random.random() < self.speckle_prob:
+            # SAR speckle follows Gamma distribution
+            shape = 1.0  # Equivalent to number of looks=1
+            speckle = torch.distributions.Gamma(shape, 1.0).sample(image.shape)
+            image = image * speckle
+
+        # Contrast variation
+        contrast_factor = random.uniform(*self.contrast_range)
+        image = sar_adjust_contrast(image, contrast_factor)
+
+        # SAR-safe brightness adjustment
+        brightness_factor = random.uniform(0.9, 1.1)
+        image = sar_adjust_brightness(image, brightness_factor)
+
+        return image.numpy(), mask.numpy()
+        
+class TransformedSubset(Dataset):
+    """Applies transformations to a subset of the dataset."""
+    def __init__(self, subset, transform=None):
+        self.subset = subset
+        self.transform = transform
+
+    def __getitem__(self, index):
+        image, mask = self.subset[index]
+        if self.transform:
+            image, mask = self.transform(image, mask)
+        return image, mask
+
+    def __len__(self):
+        return len(self.subset)
+
+
+# 1. Dataset Implementation
+class SARDataset(Dataset):
+    def __init__(self, vh_dir, vv_dir, mask_dir, num_classes, transform=None):
+        self.vh_paths = sorted(Path(vh_dir).glob("*.tif"))
+        self.vv_paths = sorted(Path(vv_dir).glob("*.tif"))
+        self.mask_paths = sorted(Path(mask_dir).glob("*.tif"))
+        self.num_classes = num_classes
+        self.transform = transform 
+        self.class_mapping = GLC_CLASS_MAPPING
+        
+        assert len(self.vh_paths) == len(self.vv_paths) == len(self.mask_paths), "Mismatched dataset sizes"
+
+    def __len__(self):
+        return len(self.vh_paths)
+
+    
+    def __getitem__(self, idx):
+        with rasterio.open(self.vh_paths[idx]) as src:
+            vh = src.read(1).astype(np.float32)
+        with rasterio.open(self.vv_paths[idx]) as src:
+            vv = src.read(1).astype(np.float32)
+        with rasterio.open(self.mask_paths[idx]) as src:
+            mask = src.read(1).astype(np.int64)
+
+        # Normalize SAR data (example normalization - adjust based on your data)
+        eps = 1e-3
+        vh = (vh - np.mean(vh)) / np.std(vh + eps)
+        vv = (vv - np.mean(vv)) / np.std(vv + eps)
+
+        image = np.stack([vh, vv], axis=0)  # 2 channels
+        #mask = torch.from_numpy(mask)
+
+
+        # Remap mask values:
+        mask = np.vectorize(self.class_mapping.get)(mask).astype(np.int64)
+        # Optionally, handle unmapped/unknown labels:
+        mask[np.isnan(mask)] = -1  # Set to ignore_index for loss
+        
+        return image, mask
+
+
+# 2. Modified Vision Transformer Model
+class SARViT(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.vit = VisionTransformer(
+            img_size=224,
+            patch_size=16,
+            in_chans=2,  # Two input channels (VH and VV)
+            num_classes=10,  # Remove classification head
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+        )
+        
+        # Segmentation head
+        self.decoder = nn.Sequential(
+            nn.Conv2d(768, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(128, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # Get patch embeddings
+        x = self.vit.patch_embed(x)
+        cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.vit.pos_embed
+        x = self.vit.blocks(x)
+        x = self.vit.norm(x)
+        
+        # Remove cls token and reshape
+        x = x[:, 1:].permute(0, 2, 1).view(x.size(0), 768, 14, 14)
+        
+        # Decode to segmentation mask
+        x = self.decoder(x)
+        x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear')
+        return x
+
+def calculate_metrics(preds, targets, num_classes, ignore_index=-1):
+    mask = targets != ignore_index
+    preds = preds[mask]
+    targets = targets[mask]
+    
+    # Pixel accuracy
+    correct = (preds == targets).sum().item()
+    total = targets.numel()
+    accuracy = correct / total if total > 0 else 0.0
+    
+    # IoU Calculation
+    ious = []
+    for cls in range(num_classes):
+        pred_inds = (preds == cls)
+        target_inds = (targets == cls)
+        
+        intersection = (pred_inds & target_inds).sum().item()
+        union = (pred_inds | target_inds).sum().item()
+        
+        iou = intersection / (union + 1e-8)  # Avoid division by zero
+        ious.append(iou)
+    
+    mean_iou = np.mean(ious) if ious else 0.0
+    return accuracy, mean_iou
+
+def mean_iou(pred, target, num_classes, ignore_index=-1):
+    """Custom IoU implementation that handles absent classes and ignored pixels."""
+    # Filter out ignored pixels
+    mask = target != ignore_index
+    pred = pred[mask]
+    target = target[mask]
+    
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred == cls)
+        target_cls = (target == cls)
+        
+        # Skip if class is absent in both
+        if not (pred_cls.any() or target_cls.any()):
+            continue  
+        
+        intersection = (pred_cls & target_cls).sum()
+        union = (pred_cls | target_cls).sum()
+        ious.append(intersection / (union + 1e-8))
+    
+    return np.mean(ious) if ious else 0.0
+
+def validate(model, val_loader, criterion, device, num_classes):
+    model.eval()
+    total_loss = 0.0
+    total_accuracy = 0.0
+    total_iou = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for images, masks in tqdm(val_loader, desc="Validating"):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            
+            _, preds = torch.max(outputs, 1)
+            
+            # Calculate accuracy (excluding ignored pixels)
+            mask_valid = masks != -1
+            correct = (preds[mask_valid] == masks[mask_valid]).sum().item()
+            total_valid = mask_valid.sum().item()
+            accuracy = correct / total_valid if total_valid > 0 else 0.0
+            
+            # Convert to numpy for IoU calculation
+            preds_np = preds.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            
+            # Calculate batch IoU
+            batch_iou = mean_iou(preds_np, masks_np, num_classes, ignore_index=-1)
+            
+            # Update metrics
+            total_loss += loss.item() * images.size(0)
+            total_accuracy += accuracy * images.size(0)
+            total_iou += batch_iou * images.size(0)
+            total_samples += images.size(0)
+    
+    avg_loss = total_loss / total_samples
+    avg_acc = total_accuracy / total_samples
+    avg_iou = total_iou / total_samples
+    
+    return avg_loss, avg_acc, avg_iou
+
+def train_model(
+    vh_dir,
+    vv_dir,
+    mask_dir,
+    num_classes,
+    batch_size=64,
+    num_epochs=100,
+    lr=1e-4,
+    val_split=0.2,
+    weight_decay=0.05,
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+):
+    # Original dataset WITHOUT transforms
+    full_dataset = SARDataset(vh_dir, vv_dir, mask_dir, num_classes, transform=None)
+    
+    # Split into subsets
+    train_size = int((1 - val_split) * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_subset, val_subset = random_split(full_dataset, [train_size, val_size])
+    
+    # Apply augmentation ONLY to training subset
+    train_dataset = TransformedSubset(train_subset, transform=SARAugment())
+    val_dataset = val_subset  # No transforms
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    
+    # Model
+    model = SARViT(num_classes).to(device)
+    
+    # Loss and Optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr,weight_decay=weight_decay)
+    scaler = GradScaler()
+    
+    best_iou = 0.0
+    best_model = None
+
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        
+        for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            optimizer.zero_grad()
+            
+            with autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item() * images.size(0)
+        
+        # Validation
+        val_loss, val_acc, val_iou = validate(model, val_loader, criterion, device, num_classes)
+        train_loss = train_loss / len(train_dataset)
+        
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Val Accuracy: {val_acc*100:.2f}% | Val IoU: {val_iou*100:.2f}%")
+        
+        # Save best model
+        if val_iou > best_iou:
+            best_iou = val_iou
+            best_model = model.state_dict()
+            torch.save(best_model, "best_sar_vit_b_augm.pth")
+            print(f"New best model saved with IoU: {val_iou*100:.2f}%")
+
+    # Load best model for return
+    model.load_state_dict(best_model)
+    return model
+
+
+# Usage Example
+if __name__ == "__main__":
+    # Training
+    trained_model = train_model(
+        vh_dir="/home/jesse.bressers/Terrascope/Classification Transformer/VH/geo_patches",
+        vv_dir="/home/jesse.bressers/Terrascope/Classification Transformer/VV/geo_patches",
+        mask_dir="/home/jesse.bressers/Terrascope/Classification Transformer/Mask_basic",
+        num_classes=10  # Set to your number of classes
+    )
+
+

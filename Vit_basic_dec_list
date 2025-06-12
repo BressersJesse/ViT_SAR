@@ -1,0 +1,137 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from timm.models.vision_transformer import VisionTransformer
+from tqdm import tqdm
+import torch.optim as optim
+from torch.cuda.amp import GradScaler, autocast
+import rasterio
+import numpy as np
+from pathlib import Path
+from pyproj import Transformer
+import os
+
+# Class mapping (must match training)
+GLC_CLASS_MAPPING = {
+    11: 0, 51: 1, 121: 2, 130: 3, 140: 4,
+    181: 5, 191: 6, 150: 7, 210: 8, 220: 9
+}
+REVERSE_MAPPING = {v: k for k, v in GLC_CLASS_MAPPING.items()}
+
+# 2. Modified Vision Transformer Model
+class SARViT(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.vit = VisionTransformer(
+            img_size=224,
+            patch_size=16,
+            in_chans=2,  # Two input channels (VH and VV)
+            num_classes=10,  # Remove classification head
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+        )
+        
+        # Segmentation head
+        self.decoder = nn.Sequential(
+            nn.Conv2d(768, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(128, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # Get patch embeddings
+        x = self.vit.patch_embed(x)
+        cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.vit.pos_embed
+        x = self.vit.blocks(x)
+        x = self.vit.norm(x)
+        
+        # Remove cls token and reshape
+        x = x[:, 1:].permute(0, 2, 1).view(x.size(0), 768, 14, 14)
+        
+        # Decode to segmentation mask
+        x = self.decoder(x)
+        x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear')
+        return x
+
+def sanitize_path(path):
+    """Remove /reynolds prefix if present"""
+    return path[len('/reynolds'):] if path.startswith('/reynolds') else path
+
+def predict_on_directories():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = SARViT(num_classes=10).to(device)
+    model.load_state_dict(torch.load("best_sar_vit_basic.pth", map_location=device))
+    model.eval()
+
+    vh_dir = sanitize_path(input("Enter VH directory path: ").strip('"'))
+    vv_dir = sanitize_path(input("Enter VV directory path: ").strip('"'))
+    output_dir = sanitize_path(input("Enter output directory path: ").strip('"'))
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    vh_files = sorted(os.listdir(vh_dir))
+    vv_files = sorted(os.listdir(vv_dir))
+
+    if len(vh_files) != len(vv_files):
+        print("Warning: Number of VH and VV files differ!")
+
+    for vh_file, vv_file in tqdm(zip(vh_files, vv_files), total=min(len(vh_files), len(vv_files))):
+        vh_path = Path(vh_dir) / vh_file
+        vv_path = Path(vv_dir) / vv_file
+
+        # Load VH
+        with rasterio.open(vh_path) as src:
+            vh = src.read(1).astype(np.float32)
+            meta = src.meta.copy()
+            transform = src.transform
+            crs = src.crs
+
+        # Load VV
+        with rasterio.open(vv_path) as src:
+            vv = src.read(1).astype(np.float32)
+
+        # Normalize (same as training)
+        vh = (vh - np.mean(vh)) / np.std(vh)
+        vv = (vv - np.mean(vv)) / np.std(vv)
+
+        # Prepare input tensor
+        image = np.stack([vh, vv], axis=0)
+        image = torch.from_numpy(image).unsqueeze(0).float().to(device)
+
+        # Predict
+        with torch.no_grad():
+            output = model(image)
+        pred_mask = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+
+        # Map back to original class IDs
+        pred_original = np.vectorize(REVERSE_MAPPING.get)(pred_mask, -9999).astype(np.int16)
+
+        # Update metadata for output
+        meta.update({
+            'driver': 'GTiff',
+            'height': pred_original.shape[0],
+            'width': pred_original.shape[1],
+            'count': 1,
+            'dtype': 'int16',
+            'nodata': -9999,
+            'crs': crs,
+            'transform': transform,
+            'compress': 'lzw'
+        })
+
+        # Save output
+        base_name = vh_file.rsplit('.', 1)[0]
+        output_path = Path(output_dir) / f"{base_name}_pred.tif"
+        with rasterio.open(output_path, 'w', **meta) as dst:
+            dst.write(pred_original[np.newaxis, :, :])
+
+    print(f"All predictions saved to {output_dir}")
+
+if __name__ == "__main__":
+    predict_on_directories()

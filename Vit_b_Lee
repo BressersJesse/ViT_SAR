@@ -1,0 +1,348 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import rasterio
+import numpy as np
+from pathlib import Path
+from timm.models.vision_transformer import VisionTransformer
+from tqdm import tqdm
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
+from torchmetrics import JaccardIndex
+from scipy.ndimage import uniform_filter
+
+GLC_CLASS_MAPPING = {
+    11: 0, 51: 1, 121: 2, 130: 3, 140: 4,
+    181: 5, 191: 6, 150: 7, 210: 8, 220: 9
+}
+NUM_CLASSES = len(GLC_CLASS_MAPPING)
+
+#Lee Filter
+class RefinedLeeFilter:
+    def __init__(self, window_size=7, looks=5.0, threshold=0.5):
+        self.window_size = window_size
+        self.looks = looks
+        self.threshold = threshold
+        self.half_window = window_size // 2
+        
+    def _get_statistics(self, array):
+        """Calculate local mean and variance using sliding window"""
+        mean = uniform_filter(array, size=self.window_size, mode='mirror')
+        mean_sq = uniform_filter(array**2, size=self.window_size, mode='mirror')
+        var = np.maximum(mean_sq - mean**2, 0)  # Force non-negative variance
+        return mean, var
+    
+    def __call__(self, sar_image):
+        """Apply Refined Lee filter to a SAR image (single channel)"""
+        # Convert to power scale if needed (assuming input is amplitude)
+        power_image = (sar_image**2).astype(np.float64)  # Use float64 for stability
+        
+        # Step 1: Calculate local statistics
+        mean_p, var_p = self._get_statistics(power_image)
+        
+        # Step 2: Compute coefficients
+        ci = np.sqrt(var_p) / (mean_p + 1e-7)  # Now safe with non-negative var_p
+        denominator = ci**2 * (1 + 1/self.looks) + 1e-12  # Add epsilon
+        k = 1 + (ci**2 - 1/self.looks) / denominator
+        k = np.clip(k, 0, 1)  # Weighting factor
+        
+        # Step 3: Apply adaptive filtering
+        filtered_power = mean_p + k * (power_image - mean_p)
+        
+        # Convert back to amplitude
+        return np.sqrt(filtered_power).astype(np.float32)  # Return float32 for compatibility
+
+
+
+
+# 1. Dataset Implementation
+class SARDataset(Dataset):
+    def __init__(self, vh_dir, vv_dir, mask_dir, num_classes, transform=None, apply_lee_filter=True):
+        self.vh_paths = sorted(Path(vh_dir).glob("*.tif"))
+        self.vv_paths = sorted(Path(vv_dir).glob("*.tif"))
+        self.mask_paths = sorted(Path(mask_dir).glob("*.tif"))
+        self.num_classes = num_classes
+        self.transform = transform
+        self.class_mapping = GLC_CLASS_MAPPING
+        self.lee_filter = RefinedLeeFilter(window_size=7) if apply_lee_filter else None
+        
+        assert len(self.vh_paths) == len(self.vv_paths) == len(self.mask_paths), "Mismatched dataset sizes"
+
+    def __len__(self):
+        return len(self.vh_paths)
+
+    
+    def __getitem__(self, idx):
+        with rasterio.open(self.vh_paths[idx]) as src:
+            vh = src.read(1).astype(np.float32)
+        with rasterio.open(self.vv_paths[idx]) as src:
+            vv = src.read(1).astype(np.float32)
+        with rasterio.open(self.mask_paths[idx]) as src:
+            mask = src.read(1).astype(np.int64)
+        
+        
+        # Apply Refined Lee filter if enabled
+        if self.lee_filter:
+            vh = self.lee_filter(vh)
+            vv = self.lee_filter(vv)
+            
+        
+        # Normalize SAR data (example normalization - adjust based on your data)
+        eps = 1e-3
+        vh = (vh - np.mean(vh)) / np.std(vh + eps)
+        vv = (vv - np.mean(vv)) / np.std(vv + eps)
+
+        image = np.stack([vh, vv], axis=0)  # 2 channels
+        #mask = torch.from_numpy(mask)
+
+        if self.transform:
+            image = self.transform(image)
+
+        # Remap mask values:
+        mask = np.vectorize(self.class_mapping.get)(mask).astype(np.int64)
+        # Optionally, handle unmapped/unknown labels:
+        mask[np.isnan(mask)] = -1  # Set to ignore_index for loss
+        
+        return image, torch.from_numpy(mask)
+
+
+# 2. Modified Vision Transformer Model
+class SARViT(nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.vit = VisionTransformer(
+            img_size=224,
+            patch_size=16,
+            in_chans=2,  # Two input channels (VH and VV)
+            num_classes=10,  # Remove classification head
+            embed_dim=768,
+            depth=12,
+            num_heads=12,
+        )
+        
+        # Segmentation head
+        self.decoder = nn.Sequential(
+            nn.Conv2d(768, 256, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear'),
+            nn.Conv2d(128, num_classes, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # Get patch embeddings
+        x = self.vit.patch_embed(x)
+        cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)
+        x = torch.cat((cls_token, x), dim=1)
+        x = x + self.vit.pos_embed
+        x = self.vit.blocks(x)
+        x = self.vit.norm(x)
+        
+        # Remove cls token and reshape
+        x = x[:, 1:].permute(0, 2, 1).view(x.size(0), 768, 14, 14)
+        
+        # Decode to segmentation mask
+        x = self.decoder(x)
+        x = torch.nn.functional.interpolate(x, size=(224, 224), mode='bilinear')
+        return x
+
+def calculate_metrics(preds, targets, num_classes, ignore_index=-1):
+    mask = targets != ignore_index
+    preds = preds[mask]
+    targets = targets[mask]
+    
+    # Pixel accuracy
+    correct = (preds == targets).sum().item()
+    total = targets.numel()
+    accuracy = correct / total if total > 0 else 0.0
+    
+    # IoU Calculation
+    ious = []
+    for cls in range(num_classes):
+        pred_inds = (preds == cls)
+        target_inds = (targets == cls)
+        
+        intersection = (pred_inds & target_inds).sum().item()
+        union = (pred_inds | target_inds).sum().item()
+        
+        iou = intersection / (union + 1e-8)  # Avoid division by zero
+        ious.append(iou)
+    
+    mean_iou = np.mean(ious) if ious else 0.0
+    return accuracy, mean_iou
+
+def mean_iou(pred, target, num_classes, ignore_index=-1):
+    """Custom IoU implementation that handles absent classes and ignored pixels."""
+    # Filter out ignored pixels
+    mask = target != ignore_index
+    pred = pred[mask]
+    target = target[mask]
+    
+    ious = []
+    for cls in range(num_classes):
+        pred_cls = (pred == cls)
+        target_cls = (target == cls)
+        
+        # Skip if class is absent in both
+        if not (pred_cls.any() or target_cls.any()):
+            continue  
+        
+        intersection = (pred_cls & target_cls).sum()
+        union = (pred_cls | target_cls).sum()
+        ious.append(intersection / (union + 1e-8))
+    
+    return np.mean(ious) if ious else 0.0
+
+def validate(model, val_loader, criterion, device, num_classes):
+    model.eval()
+    total_loss = 0.0
+    total_accuracy = 0.0
+    total_iou = 0.0
+    total_samples = 0
+
+    with torch.no_grad():
+        for images, masks in tqdm(val_loader, desc="Validating"):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            
+            _, preds = torch.max(outputs, 1)
+            
+            # Calculate accuracy (excluding ignored pixels)
+            mask_valid = masks != -1
+            correct = (preds[mask_valid] == masks[mask_valid]).sum().item()
+            total_valid = mask_valid.sum().item()
+            accuracy = correct / total_valid if total_valid > 0 else 0.0
+            
+            # Convert to numpy for IoU calculation
+            preds_np = preds.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+            
+            # Calculate batch IoU
+            batch_iou = mean_iou(preds_np, masks_np, num_classes, ignore_index=-1)
+            
+            # Update metrics
+            total_loss += loss.item() * images.size(0)
+            total_accuracy += accuracy * images.size(0)
+            total_iou += batch_iou * images.size(0)
+            total_samples += images.size(0)
+    
+    avg_loss = total_loss / total_samples
+    avg_acc = total_accuracy / total_samples
+    avg_iou = total_iou / total_samples
+    
+    return avg_loss, avg_acc, avg_iou
+
+def train_model(
+    vh_dir,
+    vv_dir,
+    mask_dir,
+    num_classes,
+    batch_size=64,
+    num_epochs=100,
+    lr=1e-4,
+    val_split=0.2,
+    weight_decay=0.05,
+    apply_lee_filter=True,
+    device='cuda' if torch.cuda.is_available() else 'cpu'
+):
+    # Dataset and DataLoader
+    full_dataset = SARDataset(vh_dir, vv_dir, mask_dir, num_classes,apply_lee_filter=apply_lee_filter)
+    
+    # Split dataset
+    train_size = int((1 - val_split) * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    
+    # Model
+    model = SARViT(num_classes).to(device)
+    
+    # Loss and Optimizer
+    criterion = nn.CrossEntropyLoss(ignore_index=-1)
+    optimizer = optim.AdamW(model.parameters(), lr=lr,weight_decay=weight_decay)
+    scaler = GradScaler()
+    
+    best_iou = 0.0
+    best_model = None
+
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        
+        for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+            images = images.to(device)
+            masks = masks.to(device)
+            
+            optimizer.zero_grad()
+            
+            with autocast(device_type='cuda', dtype=torch.float16):
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            train_loss += loss.item() * images.size(0)
+        
+        # Validation
+        val_loss, val_acc, val_iou = validate(model, val_loader, criterion, device, num_classes)
+        train_loss = train_loss / len(train_dataset)
+        
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"Val Accuracy: {val_acc*100:.2f}% | Val IoU: {val_iou*100:.2f}%")
+        
+        # Save best model
+        if val_iou > best_iou:
+            best_iou = val_iou
+            best_model = model.state_dict()
+            torch.save(best_model, "best_sar_vit_b_Lee_5.pth")
+            print(f"New best model saved with IoU: {val_iou*100:.2f}%")
+
+    # Load best model for return
+    model.load_state_dict(best_model)
+    return model
+
+# 4. Inference Function
+def predict_mask(model, vh_path, vv_path, device='cuda'):
+    # Load and preprocess data
+    with rasterio.open(vh_path) as src:
+        vh = src.read(1).astype(np.float32)
+    with rasterio.open(vv_path) as src:
+        vv = src.read(1).astype(np.float32)
+    
+    vh = (vh - np.mean(vh)) / np.std(vh)
+    vv = (vv - np.mean(vv)) / np.std(vv)
+    
+    image = np.stack([vh, vv], axis=0)
+    image = torch.from_numpy(image).unsqueeze(0).to(device)
+    
+    # Predict
+    model.eval()
+    with torch.no_grad():
+        output = model(image)
+    pred_mask = torch.argmax(output, dim=1).squeeze().cpu().numpy()
+    
+    return pred_mask
+
+# Usage Example
+if __name__ == "__main__":
+    # Training
+    trained_model = train_model(
+        vh_dir="/home/jesse.bressers/Terrascope/Classification Transformer/VH/geo_patches",
+        vv_dir="/home/jesse.bressers/Terrascope/Classification Transformer/VV/geo_patches",
+        mask_dir="/home/jesse.bressers/Terrascope/Classification Transformer/Mask_basic",
+        num_classes=10,  # Set to your number of classes
+        apply_lee_filter=True
+    )
+    
+
